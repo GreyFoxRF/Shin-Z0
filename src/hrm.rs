@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+use std::time::Instant;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileMetrics {
     pub rmssd: f32,
     pub rmssd_status: String,
@@ -12,13 +14,11 @@ pub struct ProfileMetrics {
     pub pnn50_status: String,
     pub cv: f32,
     pub cv_status: String,
-    pub sd1: f32,
-    pub sd1_status: String,
-    pub sd2: f32,
-    pub sd2_status: String,
+    pub lf_hf_ratio: f32, 
+    pub dfa_a1: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
     pub bpm: u16,
     pub rr_ms: Vec<u16>,
@@ -30,21 +30,42 @@ pub struct Telemetry {
     pub baseline: ProfileMetrics, 
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonPayload {
+    pub daemon_state: String,
+    pub sys_msg: String,
+    pub telemetry: Option<Telemetry>,
+}
+
 pub struct BioAnalyzer {
     master_buffer: Vec<u16>,
+    last_update: Option<Instant>,
 }
 
 impl Default for BioAnalyzer {
     fn default() -> Self {
-        Self {
-            master_buffer: Vec::with_capacity(300),
+        Self { 
+            master_buffer: Vec::with_capacity(1000),
+            last_update: None,
         }
     }
 }
 
 impl BioAnalyzer {
+    pub fn clear(&mut self) {
+        self.master_buffer.clear();
+        self.last_update = None;
+    }
+
     pub fn process_payload(&mut self, bytes: &[u8], subject_age: u8) -> Option<Telemetry> {
         if bytes.is_empty() { return None; }
+
+        if let Some(last) = self.last_update {
+            if last.elapsed().as_secs() >= 5 {
+                self.master_buffer.clear();
+            }
+        }
+        self.last_update = Some(Instant::now());
 
         let flags = bytes[0];
         let is_16bit = (flags & 0x01) != 0;
@@ -71,7 +92,7 @@ impl BioAnalyzer {
                 current_rr.push(rr_ms);
                 
                 self.master_buffer.push(rr_ms);
-                if self.master_buffer.len() > 300 {
+                if self.master_buffer.len() > 1000 {
                     self.master_buffer.remove(0);
                 }
                 index += 2;
@@ -92,7 +113,10 @@ impl BioAnalyzer {
         let op_len = std::cmp::min(self.master_buffer.len(), 60);
         let op_slice = &self.master_buffer[self.master_buffer.len() - op_len..];
         let operative = self.calc_profile(op_slice);
-        let baseline = self.calc_profile(&self.master_buffer);
+        
+        let base_len = std::cmp::min(self.master_buffer.len(), 300);
+        let base_slice = &self.master_buffer[self.master_buffer.len() - base_len..];
+        let baseline = self.calc_profile(base_slice);
 
         let anomalies = self.detect_anomalies(op_slice);
         let mean_rr = if self.master_buffer.is_empty() { 800.0 } else { 
@@ -101,14 +125,9 @@ impl BioAnalyzer {
         let resp_rate = if bpm > 0 { 60000.0 / mean_rr } else { 0.0 };
 
         Some(Telemetry {
-            bpm,
-            rr_ms: current_rr,
-            age: subject_age,
-            hr_zone,
-            resp_rate: resp_rate / 4.0,
-            anomalies,
-            operative,
-            baseline,
+            bpm, rr_ms: current_rr, age: subject_age,
+            hr_zone, resp_rate: resp_rate / 4.0, anomalies,
+            operative, baseline,
         })
     }
 
@@ -120,8 +139,7 @@ impl BioAnalyzer {
                 baevsky_index: 0.0, stress_status: "AWAITING...".into(),
                 pnn50: 0.0, pnn50_status: "AWAITING...".into(),
                 cv: 0.0, cv_status: "AWAITING...".into(),
-                sd1: 0.0, sd1_status: "AWAITING...".into(),
-                sd2: 0.0, sd2_status: "AWAITING...".into(),
+                lf_hf_ratio: 0.0, dfa_a1: 0.0,
             };
         }
 
@@ -147,10 +165,6 @@ impl BioAnalyzer {
         let pnn50 = (nn50_count as f32 / count) * 100.0;
         let cv = if mean_rr > 0.0 { (sdnn / mean_rr) * 100.0 } else { 0.0 };
 
-        let sd1 = rmssd / std::f32::consts::SQRT_2;
-        let sd2_sq = 2.0 * sdnn * sdnn - (rmssd * rmssd / 2.0);
-        let sd2 = if sd2_sq > 0.0 { sd2_sq.sqrt() } else { 0.0 };
-
         let mut baevsky_index = 0.0;
         if slice.len() >= 20 {
             let min_rr = *slice.iter().min().unwrap_or(&0) as f32 / 1000.0;
@@ -169,60 +183,43 @@ impl BioAnalyzer {
             }
         }
 
-        // Интерпретации
         let rmssd_status = match rmssd {
-            r if r < 20.0 => "CRITICAL [SYMPATHETIC]".to_string(),
-            r if r < 30.0 => "WARNING [TENSION]".to_string(),
-            r if r < 50.0 => "OPTIMAL [BALANCED]".to_string(),
-            _ => "RELAXED [PARASYMPATHETIC]".to_string(),
+            r if r < 20.0 => "CRITICAL".to_string(),
+            r if r < 30.0 => "WARNING".to_string(),
+            r if r < 50.0 => "OPTIMAL".to_string(),
+            _ => "RELAXED".to_string(),
         };
 
         let sdnn_status = match sdnn {
-            s if s < 30.0 => "RIGID [FATIGUE]".to_string(),
-            s if s < 50.0 => "NORMAL RANGE".to_string(),
-            _ => "HIGH [RECOVERY]".to_string(),
+            s if s < 30.0 => "RIGID".to_string(),
+            s if s < 50.0 => "NORMAL".to_string(),
+            _ => "HIGH".to_string(),
         };
 
         let stress_status = match baevsky_index {
-            b if b > 200.0 => "OVERFATIGUE [CRITICAL]".to_string(),
-            b if b > 150.0 => "HIGH STRESS [LIMITING]".to_string(),
-            b if b > 50.0  => "NORMAL ADAPTATION".to_string(),
-            b if b > 0.0   => "RELAXED [LOW TENSION]".to_string(),
-            _ => "CALCULATING...".to_string(),
+            b if b > 200.0 => "OVERFATIGUE".to_string(),
+            b if b > 150.0 => "HIGH STRESS".to_string(),
+            b if b > 50.0  => "NORMAL ADAPT".to_string(),
+            b if b > 0.0   => "RELAXED".to_string(),
+            _ => "CALCULATING".to_string(),
         };
 
         let pnn50_status = match pnn50 {
-            p if p < 3.0 => "RIGID TONE".to_string(),
+            p if p < 3.0 => "RIGID".to_string(),
             p if p < 10.0 => "MODERATE".to_string(),
             _ => "FLEXIBLE".to_string(),
         };
 
         let cv_status = match cv {
-            c if c < 2.0 => "RIGID [DEPLETED]".to_string(),
-            c if c < 6.0 => "NORMAL [STABLE]".to_string(),
-            _ => "CHAOTIC [ARRHYTHMIA?]".to_string(),
-        };
-
-        let sd1_status = match sd1 {
-            s if s < 15.0 => "LOW [SYMPATHETIC]".to_string(),
-            s if s < 30.0 => "NORMAL".to_string(),
-            _ => "HIGH [PARASYMPATHETIC]".to_string(),
-        };
-
-        let sd2_status = match sd2 {
-            s if s < 40.0 => "LOW [FATIGUE]".to_string(),
-            s if s < 80.0 => "NORMAL".to_string(),
-            _ => "HIGH".to_string(),
+            c if c < 2.0 => "RIGID".to_string(),
+            c if c < 6.0 => "NORMAL".to_string(),
+            _ => "CHAOTIC".to_string(),
         };
 
         ProfileMetrics { 
-            rmssd, rmssd_status, 
-            sdnn, sdnn_status, 
-            baevsky_index, stress_status, 
-            pnn50, pnn50_status, 
-            cv, cv_status, 
-            sd1, sd1_status, 
-            sd2, sd2_status 
+            rmssd, rmssd_status, sdnn, sdnn_status, 
+            baevsky_index, stress_status, pnn50, pnn50_status, 
+            cv, cv_status, lf_hf_ratio: 0.0, dfa_a1: 0.0, 
         }
     }
 
@@ -232,9 +229,7 @@ impl BioAnalyzer {
         for i in 0..(slice.len() - 1) {
             let diff = (slice[i + 1] as f32 - slice[i] as f32).abs();
             let prev = slice[i] as f32;
-            if prev > 0.0 && (diff / prev) > 0.20 {
-                anomalies += 1;
-            }
+            if prev > 0.0 && (diff / prev) > 0.20 { anomalies += 1; }
         }
         anomalies
     }
